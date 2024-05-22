@@ -1,6 +1,7 @@
 # PythonUserDatabase
 A python database handler that gives a lot of basic functionality needed for registering, loging and manipulatiing user data for a basic webserver or someshit
 
+More is going to be added and updated
 ## Functions
 
 User login -> success, usertoken
