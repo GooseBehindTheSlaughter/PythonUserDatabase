@@ -1,125 +1,191 @@
-import sqlite3
-import hashlib
-import secrets
-import re
-import json
+import sqlite3, secrets, re, json, bcrypt
+from datetime import datetime
+
+"""
+Some updates ive added,
+
+Encryped passwords using bcrypt instead of hashes (idk why i thought it was a good idea to use hashes)
+Re wrote majority of the queries to use less lines and look nicer
+Added last login in the user data
+Updated the information about the functions to show what they actualy do and what they return
+Cleaned a lot of the functions up to use less code where needed but keeping readablity
+Added stupid comments showing my horrible train of thought (thank god im not doing this as a job)
+"""
+
 
 class UserDatabase:
     def __init__(self, db_name="user_database.db"):
         self.conn = sqlite3.connect(db_name, check_same_thread=False)
-        self.createTable()
+        self.cursor = self.conn.cursor()
+        self.__createTable()
 
-    def createTable(self):
+    def __createTable(self):
         with self.conn:
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT NOT NULL UNIQUE,
                     password TEXT NOT NULL,
-                    token TEXT NOT NULL,
-                    user_data TEXT
+                    token TEXT NOT NULL UNIQUE,
+                    user_data TEXT,
+                    invite_code TEXT
                 )
             """)
 
-    ## Register and login functions
-    def registerUser(self, username:str, password:str):
+    def register(self, username:str, password:str) -> tuple[bool,str, str]:
         """
-        Returns Success:bool, token:str:none
+        Adds a user to the database
+        
+        - Returns
+        success : bool
+        token : str
+        error_message : str
         """
+        username = str(username)
+
+        username = self.clean_input(username).lower()
+        password = self.clean_input(str(password)).encode()
+        hashed_pwd = bcrypt.hashpw(password, bcrypt.gensalt()).decode()
+
+        # First see if the username we want is already in the database
+        with self.conn:
+            query = "SELECT username FROM users WHERE username = ?"
+            result = self.conn.execute(query, (username,)).fetchone()
+
+        if result:
+            return False, "", "username already exists"
+
+
+        # I should check if the token already exists in the database
+        # But the chance of that happening is so low fuck it :shrug:
+
+        token = secrets.token_hex(32)
+        invite_code = secrets.token_hex(2)
+        try:
+            with self.conn:
+                query = "INSERT INTO users (username, password, token, invite_code) VALUES (?, ?, ?, ?)"
+                self.conn.execute(query, (username.lower(), hashed_pwd, token, invite_code))
+            return True, token, ""
+        
+        except sqlite3.IntegrityError as error:
+            # Usually happens when 2 tokens are the same
+            return False, "", f"Integrity error, {error}" 
+        except sqlite3.OperationalError as error:
+            return False, "", f"Operation error, {error}"
+        except Exception as error:
+            return False, "", f"Unknown error, {error}"
+
+    def login(self, username:str, password:str) -> tuple[bool,str, str]:
+        """
+        Sees if the username and password exists in the current database
+        
+        - Returns
+        success : bool
+        token   : str
+        error   : str
+        """
+        username = str(username)
         username = self.clean_input(username)
         password = self.clean_input(password)
 
-        token = secrets.token_hex(32)
-        hashedPassword = self.hashPassword(password)
+        # Get the password for the account we want to login to
+        with self.conn:
+            query = "SELECT password, token FROM users WHERE username = ?"
+            result = self.conn.execute(query, (username.lower(), )).fetchone()
+
+        if not result:
+            return False, "", "Invalid username"
+
+        # Compare the stored password to the password we supplied
+        #_, _, pwd, token, _ = result
+        pwd, token = result
+
+        pwd_correct = bcrypt.checkpw(password.encode(), str(pwd).encode())     
+
+        if pwd_correct:
+            self.add_user_data(token,{"last_login" : str(datetime.now())})
+            return True, token, ""
+
+        return False, "" , "Invalid password"
+        
+
+    def remove_user(self,username:str) -> tuple[bool,str]:
+        """Removes the user based on their username"""
+        username = self.clean_input(str(username)).lower()
 
         try:
             with self.conn:
-                self.conn.execute("""
-                    INSERT INTO users (username, password, token)
-                    VALUES (?, ?, ?)
-                """, (username.lower(), hashedPassword, token))
-            return True, token
-        except sqlite3.IntegrityError:
-            return False, None 
+                cursor = self.conn.cursor()
+                cursor.execute("DELETE FROM users WHERE username = ?", (username,))
 
-    def login(self, username:str, password:str):
-        """
-        Returns Success:bool, token:str:none
-        """
-        username = self.clean_input(username)
-        password = self.clean_input(password)
-        hashedPassword = self.hashPassword(password)
+                if cursor.rowcount > 0:
+                         True, ""
+                return False, "user not found"
 
+        except Exception as error:
+            return False, f"error {error}"
+
+
+
+    def get_user_data(self, token:str) -> dict:
+        """Get the users data"""
         with self.conn:
-            cursor = self.conn.execute("""
-                SELECT token FROM users 
-                WHERE username = ? AND password = ?
-            """, (username.lower(), hashedPassword))
-            result = cursor.fetchone()
-
-        if result:
-            return True, result[0]
-        else:
-            return False, None
-    ## END
-
-    ## Userdata functions
-    def getUserData(self, token:str) -> dict:
-        """Returns userdata:dict"""
-        with self.conn:
-            cursor = self.conn.execute("""
-                SELECT id, username, user_data FROM users
-                WHERE token = ?
-            """, (token,))
+            query = "SELECT id, username, userdata, invite_code FROM users WHERE token = ?"
+            cursor = self.conn.execute(query, (token,))
             result = cursor.fetchone()
 
             if result:
-                userID, username, user_data_json = result
+                userID, username, user_data_json, invite_code = result
                 user_data = json.loads(user_data_json) if user_data_json else {}
-                return {"id": userID, "username": username, "user_data": user_data}
+                return {"id": userID, "username": username, "user_data": user_data, "invite_code" : str(invite_code)}
             else:
-                return None
+                return {}
 
-    def setUserData(self, token:str, user_data:dict) -> bool:
-        """Returns success or not, NOTE idk what this will do if you already have data in there best to use addUserData for now"""
+    def get_invite_code(self, token:str) -> str:
+        """Gets the users invite code based on their token"""
+        # This might get removed
+        with self.conn:
+            query = "SELECT invite_code FROM users WHERE token = ?"
+            result = self.conn.execute(query, (token,)).fetchone()
+        return result[0]
+
+
+    def set_user_data(self, token:str, user_data:dict) -> bool:
+        """
+        - Returns if it succeded or not
+        - This will overwrite any data that the current user has
+        either get the data and merge it or use add_user_data
+        """
         user_data_json = json.dumps(user_data)
         try:
-            with self.conn:
-                self.conn.execute("""
-                    UPDATE users 
-                    SET user_data = ?
-                    WHERE token = ?
-                """, (user_data_json, token))
+            with self.conn: 
+                query = "UPDATE users SET user_data = ? WHERE token = ?"
+                self.conn.execute(query, (user_data_json, token))
             return True
         except sqlite3.Error:
             return False
         
-    def addUserData(self,token:str ,newData:str) -> bool:
-        """Merges the new data with current data, will currently overwrite same keys"""
-        currentData = self.getUserData(token)
+    def add_user_data(self,token:str ,newData:dict) -> bool:
+        """Merges the new data with current data, will overwrite same keys"""
+        currentData = self.get_user_data(token)
 
         if currentData == None:
             return False
         
         merged = {**currentData["user_data"], **newData}
-        return self.setUserData(token, merged) ## idrk if this is gonna work well :shrug:
-    ## END
-
-
-    def hashPassword(self, password:str) -> str:
-        return hashlib.sha256(password.encode()).hexdigest()
+        return self.set_user_data(token, merged) ## idrk if this is gonna work well :shrug:
     
     def isValidToken(self, token:str) -> bool:
+        "Checks if the token is set to a user"
         with self.conn:
-            cursor = self.conn.execute("""
-                SELECT username FROM users
-                WHERE token = ?
-            """, (token,))
-            return bool(cursor.fetchone())
+            query = "SELECT username FROM users WHERE token = ?"
+            result = self.conn.execute(query, (token, )).fetchone()
+            return bool(result)
 
     @staticmethod
     def clean_input(input_str:str) -> str:
         """Cleans Input from basic SQL injection"""
+        # This isnt even needed due to how querys are setup
         cleaned_input = re.sub(r'[;\'"\\]', '', input_str)
         cleaned_input = re.sub(r'--.*$', '', cleaned_input)
         return cleaned_input
@@ -145,22 +211,4 @@ class UserDatabase:
 
 
 if __name__ == "__main__":
-    ## SOME EXAMPLE USAGE
-
-    db = UserDatabase()
-    db.registerUser("exampleuser", 123456)
-
-    success, token = db.login("exampleuser", "123456")
-
-    testData = {
-        "age" : 25,
-        "email" : "someemail@example.com"
-    }
-    
-    if success:
-        print("SUCCESSFULLY LOGGED IN, TOKEN:" + token)
-        data = db.getUserData(token)
-        print(data)
-
-    else:
-        print("Login failed :( ")
+    pass
